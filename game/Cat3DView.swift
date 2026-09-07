@@ -33,6 +33,9 @@ struct Cat3DView: UIViewRepresentable {
         // 縮小貓咪模型尺寸（原始模型過大）
         catNode.scale = SCNVector3(0.001, 0.001, 0.001)
 
+        // 播放 cat.usdz 內建的動畫（例如走路、待機等動作），並設為無限重複播放
+        playEmbeddedAnimations(on: catNode)
+
         // 環境光
         let ambientLight = SCNNode()  // 環境光節點
         ambientLight.light = SCNLight()
@@ -92,6 +95,18 @@ struct Cat3DView: UIViewRepresentable {
             // 若擊中任何節點，視為點到貓咪，觸發回呼
             if !hitResults.isEmpty {
                 onCatTapped()
+            }
+        }
+    }
+
+    // 遞迴播放節點及其所有子節點內建的動畫
+    // （USDZ 模型的動畫通常掛在子節點上，例如骨架關節，所以要往下找完整個階層）
+    private func playEmbeddedAnimations(on node: SCNNode) {
+        node.enumerateHierarchy { child, _ in
+            for key in child.animationKeys {
+                guard let player = child.animationPlayer(forKey: key) else { continue }
+                player.animation.repeatCount = .greatestFiniteMagnitude  // 無限重複播放
+                player.play()
             }
         }
     }

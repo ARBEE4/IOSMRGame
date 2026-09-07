@@ -128,6 +128,11 @@ struct ARViewWithCat: UIViewControllerRepresentable {
             modelAnchor.addChild(catScene)
             arView.scene.addAnchor(modelAnchor)
 
+            // 播放 cat.usdz 內建的動畫（例如走路、待機等動作），並設為無限重複播放
+            for animation in catScene.availableAnimations {
+                catScene.playAnimation(animation.repeat())
+            }
+
         } else if let loadedAnchor = anchor {
             // 成功載入 Reality Composer 場景，直接加入
             arView.scene.addAnchor(loadedAnchor)
