@@ -6,14 +6,10 @@
 //
 
 import SwiftUI
-import RealityKit
-import ARKit
 
 // 點擊貓咪後彈出的詳細資訊面板（情緒、飢餓度、功能按鈕）
 struct CatDetailView: View {
-    @Binding var showCatDetail: Bool  // 控制此 sheet 顯示與否（由父層傳入）
     @State var ARMode = false  // 是否進入 AR 全螢幕模式
-    @Environment(\.dismiss) var dismiss  // 用於關閉當前 View
 
     var body: some View {
 

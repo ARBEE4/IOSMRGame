@@ -9,7 +9,6 @@ import SwiftUI
 
 // 主畫面：提供進入遊戲世界（GameView）的入口
 struct MainView: View {
-    @State var showAR = false  // 預留：是否顯示 AR 畫面（目前未使用）
 
     var body: some View {
 

@@ -45,7 +45,7 @@ struct GameView: View {
 
         // 點擊貓咪後，以 sheet 形式彈出詳細資訊面板
         .sheet(isPresented: $showCatDetail) {
-            CatDetailView(showCatDetail: $showCatDetail)
+            CatDetailView()
                 .presentationDetents([.height(300)])
                 .presentationDragIndicator(.visible)
         }

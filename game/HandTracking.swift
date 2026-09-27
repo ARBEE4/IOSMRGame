@@ -11,29 +11,23 @@
 //  2. HandTracker         Vision 手部偵測流程。重的運算全部在背景佇列，
 //                         主執行緒只負責「拿影格」和「更新畫面狀態」。
 //  3. FingerOverlay       手指圓點與連線（獨立成一個 View，避免整個 AR 畫面重繪）。
-//  4. DebugPanel          除錯面板：偵測耗時、實際 fps、有沒有看到手。
 //
 //  ── 相對於最早期版本的主要修正（在 testAR 專案調通，這裡原封不動繼承）──────
 //  A. Vision 從「主執行緒」搬到背景佇列 → 不再卡住 RealityKit 算圖（卡頓主因）
 //  B. 偵測 10fps → 30fps，且移動改成「每張畫面內插」→ 不再一格一格跳
 //  C. 送進 Vision 的影像先轉正 → 模型看到的是直立的手，遠距離偵測率大幅提升
-//  D. 找到手之後只裁切手周圍那一小塊再送一次 → 遠處的小手被放大，能抓得更遠
-//  E. 捏合門檻改成「相對手掌大小」→ 手遠手近都是同一個手勢，不會誤判
-//  F. 抓取物件改用 ARView.ray(through:) 從螢幕座標反推世界座標 → 任何持機角度都正確
-//  G. 修掉「每按一次 Reset 就多開一個 Timer」的 bug（按越多次越卡）
+//  D. 捏合門檻改成「相對手掌大小」→ 手遠手近都是同一個手勢，不會誤判
+//  E. 抓取物件改用 ARView.ray(through:) 從螢幕座標反推世界座標 → 任何持機角度都正確
+//  F. 修掉「每按一次 Reset 就多開一個 Timer」的 bug（按越多次越卡）
 //
 
 import SwiftUI
 import UIKit
-import RealityKit
 import ARKit
 import Vision
-import CoreImage
 import ImageIO
-import Combine
 import QuartzCore
 import Observation
-import simd
 
 // MARK: - 1. 可調參數
 
@@ -115,23 +109,6 @@ struct HandTrackingTuning {
     /// 建議 0.3 ~ 0.8。
     var maximumJumpInMeters: Float = 0.5
 
-    // ── 遠距離偵測（放大重掃）─────────────────────────────────────
-
-    /// 是否啟用「裁切放大」：上一幀有找到手的話，這一幀只裁切手周圍那一小塊送進 Vision。
-    /// Vision 會把輸入縮放到模型尺寸，所以裁切後遠處的小手在模型眼中變大很多 → 抓得更遠。
-    /// 優點：偵測距離明顯變遠，遠處也比較不會斷。
-    /// 缺點：多一次 CIImage 裁切的成本；手瞬間移出裁切框時會多跑一次全畫面掃描（已內建自動回退）。
-    var enableZoomTracking = false
-
-    /// 裁切框相對手部大小的倍率。1.0 = 剛好框住手，2.6 = 上下左右各留很多餘裕。
-    /// 調小：放大倍率更高、更遠也抓得到。缺點是手稍微移動就跑出框外，需要回退全畫面重掃。
-    /// 建議 2.0 ~ 3.5。
-    var zoomPadding: CGFloat = 2.6
-
-    /// 裁切框的最小邊長（相對整張畫面）。避免手很小時裁出一塊過小的區域反而失真。
-    /// 建議 0.25 ~ 0.4。
-    var minimumZoomRegion: CGFloat = 0.3
-
     // ── 貓咪外觀 ───────────────────────────────────────────────
 
     /// 貓咪模型（cat.usdz）的縮放比例。原始模型過大，所以用一個很小的數字縮小。
@@ -153,10 +130,6 @@ struct HandTrackingTuning {
     /// 關閉：改用最單純的線性對應。萬一開啟後圓點位置怪怪的，可以關掉這個做 A/B 比對，
     ///      這樣就能立刻知道問題是出在座標轉換還是偵測本身。
     var useDisplayTransform = true
-
-    /// 顯示左上角的除錯資訊（偵測耗時、實際 fps、是否看到手）。
-    /// 建議先開著調參數，調好再關掉。
-    var showDebugOverlay = true
 }
 
 // MARK: - 2. 手部追蹤器
@@ -182,19 +155,8 @@ final class HandTracker {
     private(set) var isHandVisible = false
     /// 目前是否處於捏合狀態（已含遲滯處理）
     private(set) var isPinching = false
-    /// 累計捏合次數
-    private(set) var pinchCount = 0
     /// 信心度是否足夠拿來拖動貓咪
     private(set) var canDrag = false
-
-    // ── 除錯數據 ───────────────────────────────────────────────
-
-    /// 單次 Vision 推論耗時（毫秒）。若這個數字接近 33ms，代表已經追不上 30fps，該調低 detectionsPerSecond。
-    private(set) var detectionMilliseconds: Double = 0
-    /// 實際達成的偵測頻率（次／秒）
-    private(set) var actualDetectionsPerSecond: Double = 0
-    /// 這一幀是不是靠「裁切放大」抓到的
-    private(set) var isUsingZoom = false
 
     // ── 外部設定 ───────────────────────────────────────────────
 
@@ -218,9 +180,6 @@ final class HandTracker {
     /// 背景佇列：序列式（一次只跑一個），避免多個推論同時搶 CPU
     @ObservationIgnored private let queue = DispatchQueue(label: "com.game.hand-tracking", qos: .userInitiated)
 
-    /// CIImage 裁切用的繪圖環境，建立一次重複使用（每次 new 一個非常慢）
-    @ObservationIgnored private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
-
     /// 背景是否正在推論中。true 時直接跳過這一次 tick，避免工作堆積造成雪崩式延遲。
     @ObservationIgnored private var isBusy = false
 
@@ -229,12 +188,6 @@ final class HandTracker {
 
     /// 最後一次真的看到手的時間，寬限期判定用
     @ObservationIgnored private var lastSeenTime: TimeInterval = 0
-
-    /// 最後一次偵測到的手部範圍（轉正後的正規化座標），下一幀拿來裁切放大
-    @ObservationIgnored private var lastHandRegion: CGRect?
-
-    /// 上一次 apply 的時間，用來換算實際 fps
-    @ObservationIgnored private var lastApplyTime: TimeInterval = 0
 
     init(tuning: HandTrackingTuning) {
         self.tuning = tuning
@@ -290,30 +243,22 @@ final class HandTracker {
         // ARKit 的影格數量有限，抓著不放會讓 session 拿不到新影格而卡住。
         let pixelBuffer = frame.capturedImage
         let viewport = viewportSize
-        let region = tuning.enableZoomTracking ? lastHandRegion : nil
 
         // 先把要用的東西取成區域變數，背景閉包就不需要碰 self
         let request = self.request
-        let ciContext = self.ciContext
         let currentTuning = self.tuning
 
         isBusy = true
         queue.async { [weak self] in
-            let started = CACurrentMediaTime()
-            let outcome = Self.detectHand(in: pixelBuffer,
-                                          orientation: imageOrientation,
-                                          zoomRegion: region,
-                                          request: request,
-                                          ciContext: ciContext,
-                                          tuning: currentTuning)
-            let elapsed = (CACurrentMediaTime() - started) * 1000    // 換算成毫秒
+            let sample = Self.detectHand(in: pixelBuffer,
+                                         orientation: imageOrientation,
+                                         request: request,
+                                         tuning: currentTuning)
 
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isBusy = false                                   // 放行下一次 tick
-                self.detectionMilliseconds = elapsed
-                self.isUsingZoom = outcome.usedZoom
-                self.apply(outcome.sample,
+                self.apply(sample,
                            displayTransform: displayTransform,
                            imageOrientation: imageOrientation,
                            viewport: viewport)
@@ -323,12 +268,6 @@ final class HandTracker {
 
     // ── 背景執行緒：Vision 偵測 ────────────────────────────────
 
-    /// 一次偵測的結果：找到的手 + 是否是靠裁切放大找到的
-    private struct DetectionOutcome {
-        var sample: HandSample?
-        var usedZoom: Bool
-    }
-
     /// 一隻手的關鍵點，座標都在「轉正後的正規化空間」（0~1，原點左下，與 Vision 相同）
     private struct HandSample {
         var thumb: CGPoint
@@ -336,82 +275,17 @@ final class HandTracker {
         var wrist: CGPoint?
         var middleKnuckle: CGPoint?
         var confidence: Float
-        var region: CGRect          // 這隻手的外框，給下一幀裁切用
     }
 
+    /// 對整張畫面跑一次 Vision 手部偵測。沒看到手、或信心度不夠時回傳 nil。
     private static func detectHand(in pixelBuffer: CVPixelBuffer,
                                    orientation: CGImagePropertyOrientation,
-                                   zoomRegion: CGRect?,
                                    request: VNDetectHumanHandPoseRequest,
-                                   ciContext: CIContext,
-                                   tuning: HandTrackingTuning) -> DetectionOutcome {
+                                   tuning: HandTrackingTuning) -> HandSample? {
 
-        // 第一步：上一幀有找到手 → 只看手周圍那一塊並放大。遠處的小手因此變大，偵測率明顯提高。
-        if let zoomRegion {
-            if let sample = runVision(pixelBuffer: pixelBuffer,
-                                      orientation: orientation,
-                                      cropRegion: zoomRegion,
-                                      request: request,
-                                      ciContext: ciContext,
-                                      tuning: tuning) {
-                return DetectionOutcome(sample: sample, usedZoom: true)
-            }
-        }
-
-        // 第二步：裁切區找不到（手移出框外，或剛啟動）→ 回退掃描整張畫面。
-        // 這個回退讓「裁切放大」永遠不會比原本行為更差，最壞只是多跑一次。
-        let sample = runVision(pixelBuffer: pixelBuffer,
-                               orientation: orientation,
-                               cropRegion: nil,
-                               request: request,
-                               ciContext: ciContext,
-                               tuning: tuning)
-        return DetectionOutcome(sample: sample, usedZoom: false)
-    }
-
-    /// 實際跑一次 Vision。cropRegion 為 nil 時掃全畫面，否則裁切該區域。
-    private static func runVision(pixelBuffer: CVPixelBuffer,
-                                  orientation: CGImagePropertyOrientation,
-                                  cropRegion: CGRect?,
-                                  request: VNDetectHumanHandPoseRequest,
-                                  ciContext: CIContext,
-                                  tuning: HandTrackingTuning) -> HandSample? {
-
-        let handler: VNImageRequestHandler
-        // 把偵測結果換算回「整張轉正影像」的正規化座標。全畫面時就是原封不動。
-        var mapToFullImage: (CGPoint) -> CGPoint = { $0 }
-
-        if let cropRegion {
-            // 先把影像轉正，之後所有座標都在同一個空間，不用再處理旋轉
-            let oriented = CIImage(cvPixelBuffer: pixelBuffer).oriented(orientation)
-            let extent = oriented.extent
-
-            // 正規化的裁切框 → 實際像素框（CIImage 的 y 軸原點在左下，與 Vision 一致）
-            let cropRect = CGRect(x: extent.minX + cropRegion.minX * extent.width,
-                                  y: extent.minY + cropRegion.minY * extent.height,
-                                  width: cropRegion.width * extent.width,
-                                  height: cropRegion.height * extent.height)
-                .intersection(extent)
-
-            guard cropRect.width > 1, cropRect.height > 1 else { return nil }
-
-            // 裁切後把原點平移回 (0,0)，這樣 Vision 回傳的正規化座標就是相對這塊裁切圖
-            let cropped = oriented
-                .cropped(to: cropRect)
-                .transformed(by: CGAffineTransform(translationX: -cropRect.minX, y: -cropRect.minY))
-
-            handler = VNImageRequestHandler(ciImage: cropped, options: [.ciContext: ciContext])
-
-            // 裁切圖座標 → 整張影像座標
-            mapToFullImage = { point in
-                CGPoint(x: (cropRect.minX - extent.minX + point.x * cropRect.width) / extent.width,
-                        y: (cropRect.minY - extent.minY + point.y * cropRect.height) / extent.height)
-            }
-        } else {
-            // 全畫面：直接用 pixel buffer（零複製，最快的路徑），
-            // 並告訴 Vision 影像該怎麼轉正 —— 這個參數如果漏掉，模型看到的是躺著的手，是遠距離抓不到的主因。
-            handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
-        }
+        // 直接用 pixel buffer（零複製，最快的路徑），
+        // 並告訴 Vision 影像該怎麼轉正 —— 這個參數如果漏掉，模型看到的是躺著的手，是遠距離抓不到的主因。
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: orientation, options: [:])
 
         // 執行推論。失敗就當作這一幀沒看到手。
         do {
@@ -428,56 +302,21 @@ final class HandTracker {
         guard thumb.confidence >= tuning.minimumTrackingConfidence,
               index.confidence >= tuning.minimumTrackingConfidence else { return nil }
 
-        let thumbPoint = mapToFullImage(thumb.location)
-        let indexPoint = mapToFullImage(index.location)
-
         // 手腕與中指根關節：拿來量「手掌長度」，捏合門檻要用（可有可無，沒有就用備援值）
-        let wrist = confidentPoint(points[.wrist], minimum: tuning.minimumTrackingConfidence, map: mapToFullImage)
-        let knuckle = confidentPoint(points[.middleMCP], minimum: tuning.minimumTrackingConfidence, map: mapToFullImage)
+        let wrist = confidentPoint(points[.wrist], minimum: tuning.minimumTrackingConfidence)
+        let knuckle = confidentPoint(points[.middleMCP], minimum: tuning.minimumTrackingConfidence)
 
-        // 用所有可信的關鍵點算出手的外框，給下一幀裁切用
-        let region = zoomRegion(around: [thumbPoint, indexPoint, wrist, knuckle].compactMap { $0 },
-                                padding: tuning.zoomPadding,
-                                minimumSize: tuning.minimumZoomRegion)
-
-        return HandSample(thumb: thumbPoint,
-                          index: indexPoint,
+        return HandSample(thumb: thumb.location,
+                          index: index.location,
                           wrist: wrist,
                           middleKnuckle: knuckle,
-                          confidence: min(thumb.confidence, index.confidence),
-                          region: region)
+                          confidence: min(thumb.confidence, index.confidence))
     }
 
-    /// 取出「信心度足夠」的關鍵點並換算座標；不夠或不存在就回傳 nil。
-    private static func confidentPoint(_ point: VNRecognizedPoint?,
-                                       minimum: Float,
-                                       map: (CGPoint) -> CGPoint) -> CGPoint? {
+    /// 取出「信心度足夠」的關鍵點；不夠或不存在就回傳 nil。
+    private static func confidentPoint(_ point: VNRecognizedPoint?, minimum: Float) -> CGPoint? {
         guard let point, point.confidence >= minimum else { return nil }
-        return map(point.location)
-    }
-
-    /// 算出下一幀要裁切的區域：把手的外框放大 padding 倍，並保持正方形比例後夾在畫面內。
-    /// 保持正方形（正規化空間的等寬高）可以讓裁切圖的長寬比和整張影像一致，模型比較不會因為變形而失準。
-    private static func zoomRegion(around points: [CGPoint], padding: CGFloat, minimumSize: CGFloat) -> CGRect {
-        guard let first = points.first else { return CGRect(x: 0, y: 0, width: 1, height: 1) }
-
-        var minX = first.x, maxX = first.x, minY = first.y, maxY = first.y
-        for point in points {
-            minX = min(minX, point.x); maxX = max(maxX, point.x)
-            minY = min(minY, point.y); maxY = max(maxY, point.y)
-        }
-
-        let centerX = (minX + maxX) / 2
-        let centerY = (minY + maxY) / 2
-
-        // 取長邊當基準，乘上倍率，並保證不小於最小尺寸、不大於整張畫面
-        var size = max(maxX - minX, maxY - minY) * padding
-        size = min(max(size, minimumSize), 1)
-
-        // 夾回 0~1 範圍內，避免裁到畫面外
-        let x = min(max(centerX - size / 2, 0), 1 - size)
-        let y = min(max(centerY - size / 2, 0), 1 - size)
-        return CGRect(x: x, y: y, width: size, height: size)
+        return point.location
     }
 
     // ── 主執行緒：把偵測結果變成畫面狀態 ─────────────────────────
@@ -489,13 +328,6 @@ final class HandTracker {
 
         let now = CACurrentMediaTime()
 
-        // 順便統計實際達成的偵測頻率（除錯用）
-        if lastApplyTime > 0 {
-            let instant = 1.0 / max(now - lastApplyTime, 0.001)
-            actualDetectionsPerSecond = actualDetectionsPerSecond * 0.8 + instant * 0.2   // 平滑一下才不會亂跳
-        }
-        lastApplyTime = now
-
         // 這一幀沒看到手
         guard let sample else {
             // 寬限期內：什麼都不做，維持上一幀 → 圓點不閃爍、貓咪不會突然掉落
@@ -506,12 +338,10 @@ final class HandTracker {
             canDrag = false
             thumbPoint = .zero
             indexPoint = .zero
-            lastHandRegion = nil        // 下一幀回到全畫面掃描
             return
         }
 
         lastSeenTime = now
-        lastHandRegion = sample.region
 
         // 正規化座標 → 螢幕像素座標
         let rawThumb = screenPoint(from: sample.thumb, displayTransform: displayTransform, imageOrientation: imageOrientation, viewport: viewport)
@@ -544,7 +374,6 @@ final class HandTracker {
             if ratio > tuning.pinchReleaseRatio { isPinching = false }
         } else if ratio < tuning.pinchEngageRatio {
             isPinching = true
-            pinchCount += 1
         }
     }
 
@@ -652,29 +481,5 @@ struct FingerOverlay: View {
             }
         }
         .allowsHitTesting(false)        // 這層不吃觸控，不會擋到下面的按鈕
-    }
-}
-
-// MARK: - 4. 除錯面板
-
-/// 左上角除錯資訊：調參數時看這裡就知道瓶頸在哪
-struct DebugPanel: View {
-
-    let tracker: HandTracker
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(tracker.isHandVisible ? "Hand: ✅" : "Hand: —")
-            Text(tracker.isPinching ? "Pinch: ✅  (\(tracker.pinchCount))" : "Pinch: —  (\(tracker.pinchCount))")
-            // 這個數字若接近 1000 / detectionsPerSecond，代表 Vision 已經追不上，該降低頻率
-            Text(String(format: "Vision: %.1f ms", tracker.detectionMilliseconds))
-            Text(String(format: "Rate: %.0f fps", tracker.actualDetectionsPerSecond))
-            Text(tracker.isUsingZoom ? "Mode: zoom" : "Mode: full frame")
-        }
-        .font(.system(size: 12, weight: .medium, design: .monospaced))
-        .foregroundColor(.white)
-        .padding(8)
-        .background(Color.black.opacity(0.45))
-        .cornerRadius(8)
     }
 }

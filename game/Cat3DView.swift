@@ -10,7 +10,6 @@ struct Cat3DView: UIViewRepresentable {
         let sceneView = SCNView()  // SceneKit 渲染視圖
         sceneView.scene = SCNScene()  // 建立空場景
         sceneView.backgroundColor = .clear  // 背景透明，讓上層 UI 可疊加
-        sceneView.allowsCameraControl = false  // 不允許使用者手動旋轉/縮放相機
 
         // 加入點擊手勢，點擊後呼叫 Coordinator 的 handleTap
         let tapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))

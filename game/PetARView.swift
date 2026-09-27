@@ -2,7 +2,7 @@
 //  PetARView.swift
 //  AR with 3D cat model + hand-tracking pinch-and-drag control
 //
-//  手部追蹤（HandTracker / FingerOverlay / DebugPanel）的核心邏輯搬到 HandTracking.swift，
+//  手部追蹤（HandTracker / FingerOverlay）的核心邏輯搬到 HandTracking.swift，
 //  這個檔案只負責：AR 畫面本身的組成，以及「貓咪控制器」—— 移植自 testAR 專案的
 //  BlockController，把原本操控的藍色方塊換成 cat.usdz 載入的貓咪模型，
 //  捏合手勢照舊，可以把貓咪從螢幕上抓起來、拖著移動。
@@ -67,7 +67,7 @@ struct PetARView: View {
                 .background(Color.black)
             }
 
-            // 第四層：關閉鈕、除錯面板、重置貓咪按鈕，由上而下排在同一個 VStack 避免互相疊在一起
+            // 第四層：關閉鈕、重置貓咪按鈕，由上而下排在同一個 VStack 避免互相疊在一起
             VStack {
                 HStack {
                     Button {
@@ -80,14 +80,6 @@ struct PetARView: View {
                             .shadow(radius: 3)
                     }
                     Spacer()
-                }
-
-                if tuning.showDebugOverlay {
-                    HStack {
-                        DebugPanel(tracker: tracker)
-                            .padding(.horizontal)
-                        Spacer()
-                    }
                 }
 
                 Spacer()
