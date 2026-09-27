@@ -1,7 +1,7 @@
 //
 //  CatDetailView.swift
 //  game
-//
+//  點小貓後的bar + button -> PetARView
 //  Your original style + buttons, simplified
 //
 

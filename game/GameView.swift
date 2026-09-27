@@ -33,7 +33,7 @@ struct GameView: View {
             .padding()
             .background(Color.gray.opacity(0.1))
 
-            // 3D 貓咪畫面，含隨機移動動畫；點擊貓咪時觸發 onCatTapped
+            // 3D 貓咪畫面，含隨機移動動畫；點擊貓咪時觸發 onCatTapped 轉到CatDetailView
             Cat3DView(onCatTapped: {
                 showCatDetail = true
             })

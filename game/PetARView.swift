@@ -20,7 +20,7 @@ struct PetARView: View {
     @State private var isLoading = true  // 是否顯示載入中畫面
     @State private var arSession = ARSession()  // 此畫面專用的 AR Session
 
-    // 手部追蹤參數與追蹤器：與 testAR 專案共用同一份邏輯（見 HandTracking.swift）
+    // build handtracker call HandTracking.swift
     private let tuning = HandTrackingTuning.standard
     @State private var tracker = HandTracker(tuning: .standard)
     // 重置用的計數器。用計數器而不是 Bool，就不需要在畫面更新中把旗標寫回 false。
@@ -46,7 +46,7 @@ struct PetARView: View {
 
             // 第二層：手指圓點視覺化（拇指／食指／捏合連線），獨立成一層避免拖慢 AR 畫面重繪
             GeometryReader { geo in
-                FingerOverlay(tracker: tracker)
+                FingerOverlay(tracker: tracker) // call function from handtracking
                     .onAppear { tracker.viewportSize = geo.size }
                     .onChange(of: geo.size) { _, newSize in tracker.viewportSize = newSize }
             }
