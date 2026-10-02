@@ -85,9 +85,10 @@ struct HandTrackingTuning {
 
     /// 捏合「成立」門檻：拇指到食指的距離 ÷ 手掌長度，小於這個值算捏起來。
     /// 用比例而不是固定像素，手離鏡頭遠近都不影響判定（固定像素的話，手一遠就會誤判成一直在捏）。
-    /// 調高：更容易觸發。缺點是手指沒真的併攏也會被當成捏合。
-    /// 建議 0.28 ~ 0.45。
-    var pinchEngageRatio: CGFloat = 0.35
+    /// 調高：更容易觸發。缺點是手指沒真的併攏也會被當成捏合（揮手時手指靠近也可能誤抓）。
+    /// 調低：手指要真的碰在一起才算，比較不會誤抓。缺點是遠距離或手指較粗時比較難捏到。
+    /// 建議 0.2 ~ 0.4。
+    var pinchEngageRatio: CGFloat = 0.25
 
     /// 捏合「放開」門檻，必須比上面大 → 形成遲滯區（hysteresis）。
     /// 好處：在門檻邊緣時不會「捏開捏開」高速抖動，貓咪不會閃爍掉落。
@@ -108,6 +109,51 @@ struct HandTrackingTuning {
     /// 調小：更能擋掉亂跳。缺點是快速揮手時會被誤擋，貓咪跟不上。
     /// 建議 0.3 ~ 0.8。
     var maximumJumpInMeters: Float = 0.5
+
+    // ── 撫摸（揮手）判定 ─────────────────────────────────────────
+    // 手張開、在貓咪上方來回揮動 → 貓咪坐下、歪頭、冒愛心（PetStrokeDetector.swift + CatPetSwap.swift）。
+
+    /// 手的移動方向要「反轉」幾次才算撫摸（右 → 左 算一次反轉）。
+    /// 調高：不容易誤觸發。缺點是要揮比較多下。
+    /// 調低：很快就觸發。缺點是手隨便晃一下也會算。
+    /// 建議 2 ~ 4。
+    var petReversalsNeeded: Int = 3
+
+    /// 上面那幾次反轉必須在幾秒內完成。
+    /// 調高：揮得慢也算。缺點是斷斷續續的動作也會被累積成撫摸。
+    /// 調低：一定要連續快速揮。缺點是動作慢的人觸發不了。
+    /// 建議 1.5 ~ 3。
+    var petTimeWindow: TimeInterval = 2.0
+
+    /// 每一下至少要移動多遠，用「螢幕短邊的比例」表示（0.03 = 3%，iPhone 直拿約 12 點）。
+    /// 用比例而不是固定點數，不同尺寸的手機手感才會一致。
+    /// 調高：手抖和 Vision 的雜訊不會被當成揮手。缺點是要揮大一點。
+    /// 建議 0.03 ~ 0.06。
+    var petMinimumStrokeFraction: CGFloat = 0.03
+
+    /// 貓咪在螢幕上的範圍往外擴大多少點，手在這個範圍內揮動才算「在貓咪上方」。
+    /// 調大：比較好觸發（貓咪在畫面上很小時特別有用）。缺點是手在貓咪旁邊揮也會算。
+    /// 建議 30 ~ 80。
+    var petZonePadding: CGFloat = 80
+
+    /// 手離開貓咪範圍多久（秒）才把撫摸進度清空。
+    /// 允許短暫跑出去：揮到最邊邊時手常常會稍微超出範圍。
+    /// 調高：比較寬容。缺點是手離開後再回來，舊的進度還在。建議 0.3 ~ 0.8。
+    var petZoneLeaveGrace: TimeInterval = 0.6
+
+    /// 手要「張多開」才算揮手：拇指到食指的距離 ÷ 手掌長度（和捏合判定是同一個比例）。
+    /// 捏合在 0.25 以下成立、0.55 以上放開。手掌位置改用指節之後，手指張合本身已經不會造成誤判，
+    /// 所以這裡只要擋掉「手幾乎是握著的」就好；沒達到時只跳過那一格，不會清空進度。
+    /// 調高：更不容易誤觸發。缺點是手指併攏著摸可能不算，揮手變難觸發。
+    /// 調低：手半開也能摸。缺點是換手勢時比較容易誤觸發。
+    /// 建議 0.4 ~ 0.8。
+    var petOpenHandRatio: CGFloat = 0.45
+
+    /// 捏合放開（或把貓咪放下）之後，要等幾秒才開始算揮手。放開那一下的手部移動就不會被算進去。
+    /// 調高：更不容易誤觸發。缺點是放開後要等久一點才能摸。
+    /// 調低：放開後馬上能摸。缺點是放開的動作可能被當成揮手。
+    /// 建議 0.3 ~ 1.0。
+    var petCooldownAfterPinch: TimeInterval = 0.5
 
     // ── 貓咪外觀 ───────────────────────────────────────────────
 
@@ -151,6 +197,12 @@ final class HandTracker {
     private(set) var indexPoint: CGPoint = .zero
     /// 拇指與食指的中點，抓取判定用
     private(set) var pinchMidpoint: CGPoint = .zero
+    /// 手掌位置：中指根關節（指節，像素），揮手偵測用。
+    /// 手指張開、併攏時它幾乎不動，所以換手勢不會被誤認成揮手；只要看得到手指就看得到它（手腕常常在畫面外）。
+    /// 沒偵測到時維持上一次的位置。
+    private(set) var palmPoint: CGPoint = .zero
+    /// 手張開的程度：拇指到食指的距離 ÷ 手掌長度（0.25 以下 = 捏合；越大 = 張越開）
+    private(set) var opennessRatio: CGFloat = 0
     /// 目前畫面中是否看得到手
     private(set) var isHandVisible = false
     /// 目前是否處於捏合狀態（已含遲滯處理）
@@ -338,6 +390,8 @@ final class HandTracker {
             canDrag = false
             thumbPoint = .zero
             indexPoint = .zero
+            palmPoint = .zero                   // 下次看到手時直接從新位置開始，不會從舊位置滑過去
+            opennessRatio = 0
             return
         }
 
@@ -356,18 +410,32 @@ final class HandTracker {
         isHandVisible = true
         canDrag = sample.confidence >= tuning.minimumDragConfidence
 
+        // 手腕與中指根關節 → 螢幕像素（手掌長度和手掌位置都要用；沒偵測到時是 nil）
+        let wristPoint = sample.wrist.map {
+            screenPoint(from: $0, displayTransform: displayTransform, imageOrientation: imageOrientation, viewport: viewport)
+        }
+        let knucklePoint = sample.middleKnuckle.map {
+            screenPoint(from: $0, displayTransform: displayTransform, imageOrientation: imageOrientation, viewport: viewport)
+        }
+
+        // 手掌位置 = 中指根關節（揮手偵測用）。不需要手腕：揮手時手靠近鏡頭，手腕常常在畫面外；
+        // 而且揮手是以手腕為軸擺動，指節移動的距離大約是「手腕與指節中點」的兩倍，比較容易偵測。
+        // 沒偵測到時維持上一次的位置，不會亂跳。
+        if let knuckle = knucklePoint {
+            palmPoint = smooth(palmPoint, toward: knuckle)
+        }
+
         // ── 捏合判定 ──
         // 指尖距離除以手掌長度 → 得到與距離無關的比例值
         let fingerGap = hypot(thumbPoint.x - indexPoint.x, thumbPoint.y - indexPoint.y)
         let palmSize: CGFloat
-        if let wrist = sample.wrist, let knuckle = sample.middleKnuckle {
-            let a = screenPoint(from: wrist, displayTransform: displayTransform, imageOrientation: imageOrientation, viewport: viewport)
-            let b = screenPoint(from: knuckle, displayTransform: displayTransform, imageOrientation: imageOrientation, viewport: viewport)
+        if let a = wristPoint, let b = knucklePoint {
             palmSize = max(hypot(a.x - b.x, a.y - b.y), 1)    // 至少 1，避免除以 0
         } else {
             palmSize = tuning.fallbackPalmSizeInPixels
         }
         let ratio = fingerGap / palmSize
+        opennessRatio = ratio                                  // 手張開的程度（揮手判定也要用）
 
         // 遲滯：捏起來用小門檻、放開用大門檻，中間那段維持現狀 → 不會在邊界高速抖動
         if isPinching {

@@ -7,6 +7,9 @@
 //  BlockController，把原本操控的藍色方塊換成 cat.usdz 載入的貓咪模型，
 //  捏合手勢照舊，可以把貓咪從螢幕上抓起來、拖著移動。
 //
+//  揮手撫摸：張開的手在貓咪上方來回揮動 → 貓咪坐下、左右歪頭、冒出愛心，播完繼續走路
+//  （判斷規則在 PetStrokeDetector.swift，換貓與播放在 CatPetSwap.swift，參數在 HandTrackingTuning）。
+//
 
 import SwiftUI
 import RealityKit
@@ -169,6 +172,29 @@ final class CatController {
     private var hasPlacedCat = false
     private var lastHandledResetCounter = 0
 
+    // ── 撫摸反應（坐下、歪頭、冒愛心）───────────────────────────────
+
+    /// 走路貓 ↔ 撫摸反應貓 的切換器（見 CatPetSwap.swift）。載入完成前是 nil，這段時間不能撫摸。
+    private var catSwap: CatPetSwap?
+    /// CatPetSwap 載入完成前，先用原本的方式播放走路動畫；載入完成後停掉，交給 CatPetSwap 播。
+    private var fallbackWalkControllers: [AnimationPlaybackController] = []
+    /// 揮手（撫摸）偵測器（見 PetStrokeDetector.swift）
+    private var petDetector = PetStrokeDetector()
+    /// 撫摸偵測用的時鐘：每張畫面累加 deltaTime（秒）
+    private var petClock: TimeInterval = 0
+    /// 手已經離開「貓咪範圍」多久了（秒），超過寬限時間就清空撫摸進度
+    private var timeOutsidePetZone: TimeInterval = 0
+    /// 距離上一次捏合／抓著貓咪過了多久（秒）。放開後要等 petCooldownAfterPinch 才開始算揮手。
+    /// 一開始設很大，代表「很久沒捏了」，進畫面就能直接摸。
+    private var timeSincePinch: TimeInterval = 999
+
+    /// 撫摸反應是否正在播放。
+    /// CatPetSwap 是 @MainActor 類別；這裡的呼叫都發生在主執行緒（畫面更新、SwiftUI），
+    /// 所以用 MainActor.assumeIsolated 告訴編譯器「現在就在主執行緒上」。
+    private var isReacting: Bool {
+        MainActor.assumeIsolated { catSwap?.isReacting ?? false }
+    }
+
     deinit {
         renderSubscription?.cancel()
     }
@@ -181,11 +207,9 @@ final class CatController {
         self.tuning = tuning
 
         // 啟動 AR。不開平面偵測：貓咪是靠手勢直接在螢幕空間拖動，不是放在偵測到的平面上，開了也用不到。
+        // 也不開人物分割（personSegmentationWithDepth）：上面的 .disablePersonOcclusion 已經關掉「手遮住貓咪」，
+        // 開了只會多耗電，還會在主控台印出 "padding deconvolution…" 訊息。
         let config = ARWorldTrackingConfiguration()
-        // 若裝置支援人物分割（含深度），則啟用此功能，讓真實的手可以正確遮擋虛擬貓咪
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.personSegmentationWithDepth) {
-            config.frameSemantics.insert(.personSegmentationWithDepth)
-        }
         arView.session.run(config)
 
         // 讓追蹤器共用 ARView 自己的 session（session 只有一個擁有者，狀態不會打架）
@@ -198,9 +222,10 @@ final class CatController {
         }
         catEntity.scale = SIMD3<Float>(repeating: tuning.catScale)
 
-        // 播放 cat.usdz 內建的動畫（例如走路、待機等動作），並設為無限重複播放
+        // 播放 cat.usdz 內建的動畫（例如走路、待機等動作），並設為無限重複播放。
+        // 記住這些播放控制器：撫摸反應載入完成後要停掉它們，改由 CatPetSwap 接手播放走路。
         for animation in catEntity.availableAnimations {
-            catEntity.playAnimation(animation.repeat())
+            fallbackWalkControllers.append(catEntity.playAnimation(animation.repeat()))
         }
 
         let anchor = AnchorEntity(world: SIMD3<Float>(repeating: 0))
@@ -208,10 +233,32 @@ final class CatController {
         arView.scene.addAnchor(anchor)
         self.cat = catEntity
 
+        // 在背景載入撫摸反應（cat_sit_headturn_hearts.usdz），放在走路貓旁邊並先隱藏。
+        // 必須在貓咪加進場景之後才呼叫：CatPetSwap 要和走路貓用同一個父節點（anchor）。
+        loadPetReaction(for: catEntity)
+
         // 每張算圖畫面（約 60fps）跑一次。
         // 這是「順不順」的關鍵：偵測只有 30fps，但貓咪是 60fps 內插移動。
         renderSubscription = arView.scene.subscribe(to: SceneEvents.Update.self) { [weak self] event in
             self?.onRender(deltaTime: event.deltaTime)
+        }
+    }
+
+    /// 載入撫摸反應並接手走路動畫。
+    /// 載入是非同步的（iOS 18 的 Entity(named:)），不會卡住畫面；失敗時貓咪維持原本的走路動畫，只是不能撫摸。
+    private func loadPetReaction(for walkingCat: ModelEntity) {
+        Task { @MainActor [weak self] in                                   // 在主執行緒上跑非同步工作（RealityKit 物件要在主執行緒使用）
+            let swap = CatPetSwap(walkModel: walkingCat)                   // 建立切換器，對象是目前這隻走路貓
+            do {
+                try await swap.load()                                      // 載入反應檔，放在走路貓旁邊、隱藏、停在第一格
+                guard let self else { return }                             // AR 畫面已經關掉 → 不用繼續
+                self.fallbackWalkControllers.forEach { $0.stop() }         // 停掉原本的走路動畫
+                self.fallbackWalkControllers.removeAll()                   // 清空，不再需要
+                swap.startWalking()                                        // 改由 CatPetSwap 播走路（它要知道步伐走到哪，才能無縫切換）
+                self.catSwap = swap                                        // 從這一刻起可以撫摸
+            } catch {
+                print("⚠️ 撫摸反應載入失敗，貓咪維持原本的走路動畫：\(error)") // 例如檔案沒加進 App → 看 Xcode 下方的主控台
+            }
         }
     }
 
@@ -226,17 +273,33 @@ final class CatController {
             placeCatInFrontOfCamera()
         }
 
+        // 撫摸反應播放中（坐下 → 歪頭 → 冒愛心 → 起身，約 4.7 秒）：走路貓被隱藏，換成反應貓在原地播動畫。
+        // 這段時間暫停抓取、移動與撫摸偵測，播完後貓咪回到同一個位置繼續走路。
+        if isReacting {
+            isHolding = false                    // 反應中不能抓貓咪
+            wasPinching = tracker.isPinching     // 播完時手如果還捏著，不算「剛捏下去」，避免一播完就被抓走
+            petDetector.reset()                  // 撫摸進度歸零，避免播完馬上又觸發
+            timeOutsidePetZone = 0               // 同上
+            return                               // 不移動貓咪（反應貓的位置在切換那一刻就固定了）
+        }
+
         let currentWorld = cat.position(relativeTo: nil)
+
+        // 貓咪目前的 3D 外框（世界座標）。抓取要用它的中心，撫摸要用它在螢幕上的範圍。
+        let bounds = cat.visualBounds(relativeTo: nil)
 
         // 貓咪模型的原點通常在腳底（USDZ 常見慣例），但使用者會直覺地對著「身體」捏合，
         // 所以這裡另外算出視覺外框的中心點，抓取判定要用這個點，而不是腳底的原點。
-        let centerOffset = cat.visualBounds(relativeTo: nil).center - currentWorld
+        let centerOffset = bounds.center - currentWorld
 
         // 更新貓咪「身體中心」在螢幕上的位置（抓取判定要用）
         catScreenPosition = arView.project(currentWorld + centerOffset)
 
         // 更新抓取狀態（貓咪大小固定，不會被捏合改變）
         updateGrab(arView: arView, tracker: tracker, currentWorld: currentWorld, centerOffset: centerOffset)
+
+        // 撫摸偵測：手張開、在貓咪上方來回揮動 → 觸發坐下 + 歪頭 + 冒愛心
+        updatePetting(arView: arView, tracker: tracker, bounds: bounds, deltaTime: deltaTime)
 
         // 平滑移動：以固定的時間常數往目標靠近。
         // 用 exp 而不是固定比例，是為了讓結果與畫面更新率無關（60fps 和 30fps 手感一致）。
@@ -288,6 +351,89 @@ final class CatController {
         wasPinching = pinching
     }
 
+    // ── 撫摸（揮手）偵測 ─────────────────────────────────────────
+
+    /// 手張開、在貓咪上方來回揮動 → 叫 CatPetSwap 播放撫摸反應。
+    /// 規則（參數在 HandTrackingTuning）：2 秒內方向反轉 3 次（例如 右 → 左 → 右 → 左），每一下至少移動螢幕短邊的 3%。
+    /// 避免「換手勢被當成揮手」的三道保護：
+    ///   A. 用手掌位置（palmPoint，中指根關節）算來回，不用指尖：手指張合時它幾乎不動
+    ///   B. 捏合放開或放下貓咪後，冷卻 petCooldownAfterPinch 秒才開始算
+    ///   C. 手要張開（opennessRatio ≥ petOpenHandRatio）才算
+    /// 只有「真的不是在摸」（沒載入、看不到手、正在捏合／抓著貓咪、離開貓咪太久）才清空進度；
+    /// 揮手時一瞬間的小狀況（手看起來半合、指尖剛好超出範圍）只跳過那一格，不會把前面揮的都作廢。
+    private func updatePetting(arView: ARView, tracker: HandTracker, bounds: BoundingBox, deltaTime: TimeInterval) {
+        petClock += deltaTime                                              // 累加撫摸偵測的時鐘
+
+        // B. 冷卻計時：正在捏合或抓著貓咪就歸零，放開後才開始累加
+        if tracker.isPinching || isHolding {
+            timeSincePinch = 0                                             // 還在「抓」的手勢
+        } else {
+            timeSincePinch += deltaTime                                    // 放開多久了
+        }
+
+        // 真的不是在摸 → 清空進度：反應檔還沒載入、看不到手、正在捏合、或正抓著貓咪（「抓」的手勢）
+        guard catSwap != nil, tracker.isHandVisible, !tracker.isPinching, !isHolding else {
+            petDetector.reset()                                            // 進度歸零
+            timeOutsidePetZone = 0                                         // 離開計時歸零
+            return
+        }
+
+        // 暫時的狀況 → 只跳過這一格、保留進度：剛放開捏合還在冷卻中（B）、或手這一瞬間看起來沒張開（C）
+        guard timeSincePinch >= tuning.petCooldownAfterPinch,              // B. 冷卻結束
+              tracker.opennessRatio >= tuning.petOpenHandRatio else {      // C. 手有張開
+            return                                                         // 下一格再看
+        }
+
+        // 貓咪在螢幕上的範圍（3D 外框投影到螢幕）；貓咪在鏡頭後方時拿不到 → 這一格不判斷
+        guard let catRect = screenRect(of: bounds, in: arView) else {
+            petDetector.reset()                                            // 看不到貓咪，進度歸零
+            return
+        }
+        // 往外多留一點空間：貓咪在畫面上不大，揮到最旁邊時手常常會稍微超出
+        let petZone = catRect.insetBy(dx: -tuning.petZonePadding, dy: -tuning.petZonePadding)
+
+        // 手不在貓咪範圍內：指尖或指節其中一個在範圍內就算在（揮到最邊邊時指尖常常會甩出去）。
+        // 短暫離開可以接受，離開太久才清空進度。
+        guard petZone.contains(tracker.pinchMidpoint) || petZone.contains(tracker.palmPoint) else {
+            timeOutsidePetZone += deltaTime                                // 累計離開時間
+            if timeOutsidePetZone > tuning.petZoneLeaveGrace {             // 離開太久
+                petDetector.reset()                                        // 進度歸零
+            }
+            return
+        }
+        timeOutsidePetZone = 0                                             // 手回到貓咪上方
+
+        // 每一下最少移動距離：螢幕短邊 × 比例（不同尺寸的手機手感一致）
+        let minimumStroke = min(arView.bounds.width, arView.bounds.height) * tuning.petMinimumStrokeFraction
+
+        // A. 把「手掌」位置餵給偵測器（手指張合不影響）；方向反轉次數達標就回傳 true
+        let petted = petDetector.feed(tracker.palmPoint,
+                                      time: petClock,
+                                      minimumStroke: minimumStroke,
+                                      reversalsNeeded: tuning.petReversalsNeeded,
+                                      window: tuning.petTimeWindow)
+        guard petted else { return }                                       // 還沒揮夠 → 下一格繼續累積
+
+        petDetector.reset()                                                // 觸發一次就從頭算
+        MainActor.assumeIsolated { catSwap?.pet() }                        // 貓咪走完這一步 → 坐下、歪頭、冒愛心
+    }
+
+    /// 把貓咪的 3D 外框（8 個角）投影到螢幕上，回傳剛好包住它們的矩形（螢幕點座標）。
+    /// 任何一個角投影失敗（例如在鏡頭後方）就回傳 nil。
+    private func screenRect(of bounds: BoundingBox, in arView: ARView) -> CGRect? {
+        guard !bounds.isEmpty else { return nil }                          // 外框無效（例如模型沒有網格）
+        var rect = CGRect.null                                             // 空矩形，之後把每個角併進來
+        for x in [bounds.min.x, bounds.max.x] {                            // 外框的左、右
+            for y in [bounds.min.y, bounds.max.y] {                        // 外框的下、上
+                for z in [bounds.min.z, bounds.max.z] {                    // 外框的後、前
+                    guard let point = arView.project(SIMD3<Float>(x, y, z)) else { return nil } // 3D 角 → 螢幕點
+                    rect = rect.union(CGRect(origin: point, size: .zero))  // 把這個點併進矩形
+                }
+            }
+        }
+        return rect                                                        // 貓咪在螢幕上的範圍
+    }
+
     // ── 重置 ───────────────────────────────────────────────────
 
     /// 只有計數器變動時才真的重置。
@@ -314,5 +460,8 @@ final class CatController {
 
         // 大小固定不變，這裡只是確保重置後仍是基準值
         cat.scale = SIMD3<Float>(repeating: tuning.catScale)
+
+        // 撫摸反應播放中按了 Reset：坐著的貓也一起移過去，播完換回走路貓時才不會跳位置
+        MainActor.assumeIsolated { catSwap?.matchPetToWalk() }
     }
 }
