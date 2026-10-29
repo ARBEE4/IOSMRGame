@@ -10,7 +10,7 @@ import SwiftUI
 // 點擊貓咪後彈出的詳細資訊面板（情緒、飢餓度、功能按鈕）
 struct CatDetailView: View {
     @State var ARMode = false  // 是否進入 AR 全螢幕模式
-
+    @State private var Album = false // 預設相簿 false
     var body: some View {
 
         ZStack {
@@ -51,8 +51,8 @@ struct CatDetailView: View {
 
 
                     // TripWith 按鈕：尚未實作功能（預留位置）
-                    Button("TripWith"){
-                        // 此處放入你的旅行功能邏輯
+                    Button("Album"){
+                        Album = true // 開相簿 true
                     }
                     .padding(.horizontal, 40)
                     .padding(.vertical, 14)
@@ -73,7 +73,11 @@ struct CatDetailView: View {
         .fullScreenCover(isPresented: $ARMode){
             PetARView()
         }
-
+        
+        // if Album true
+        .sheet(isPresented: $Album){
+            AlbumView()
+        }
     }//body end
 
 

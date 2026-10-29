@@ -66,7 +66,11 @@ private struct AxisStrokeCounter {
 
         if direction == 0 {                                              // 方向還沒決定
             if abs(value - start) >= minimumStroke {                     // 離起點夠遠 → 第一下成立
-                direction = value > start ? 1 : -1                       // 往哪邊走就定哪個方向
+                if value > start {                                       // 往數值變大的方向走（往右／往下）
+                    direction = 1
+                } else {                                                 // 往數值變小的方向走（往左／往上）
+                    direction = -1
+                }
                 extreme = value                                          // 從這裡開始記最遠點
             }
             return reversalTimes.count                                   // 第一下不算反轉

@@ -411,11 +411,13 @@ final class HandTracker {
         canDrag = sample.confidence >= tuning.minimumDragConfidence
 
         // 手腕與中指根關節 → 螢幕像素（手掌長度和手掌位置都要用；沒偵測到時是 nil）
-        let wristPoint = sample.wrist.map {
-            screenPoint(from: $0, displayTransform: displayTransform, imageOrientation: imageOrientation, viewport: viewport)
+        var wristPoint: CGPoint? = nil                                   // 手腕的螢幕位置（沒偵測到 = nil）
+        if let wrist = sample.wrist {                                    // 這一幀有偵測到手腕
+            wristPoint = screenPoint(from: wrist, displayTransform: displayTransform, imageOrientation: imageOrientation, viewport: viewport)
         }
-        let knucklePoint = sample.middleKnuckle.map {
-            screenPoint(from: $0, displayTransform: displayTransform, imageOrientation: imageOrientation, viewport: viewport)
+        var knucklePoint: CGPoint? = nil                                 // 中指根關節的螢幕位置（沒偵測到 = nil）
+        if let knuckle = sample.middleKnuckle {                          // 這一幀有偵測到中指根關節
+            knucklePoint = screenPoint(from: knuckle, displayTransform: displayTransform, imageOrientation: imageOrientation, viewport: viewport)
         }
 
         // 手掌位置 = 中指根關節（揮手偵測用）。不需要手腕：揮手時手靠近鏡頭，手腕常常在畫面外；
@@ -495,9 +497,14 @@ final class HandTracker {
 
     /// 目前畫面方向（使用者可能已經把手機轉過來了）
     private static var currentInterfaceOrientation: UIInterfaceOrientation {
-        let scene = UIApplication.shared.connectedScenes
-            .first { $0.activationState == .foregroundActive } as? UIWindowScene
-        return scene?.interfaceOrientation ?? .portrait
+        for scene in UIApplication.shared.connectedScenes {               // App 所有的場景
+            if scene.activationState == .foregroundActive {               // 正顯示在畫面上的那一個
+                if let windowScene = scene as? UIWindowScene {            // 只有視窗場景才知道畫面方向
+                    return windowScene.interfaceOrientation               // 回傳目前的方向
+                }
+            }
+        }
+        return .portrait                                                  // 找不到 → 當作直立
     }
 
     /// 畫面方向 → 影像該怎麼轉才會是直立的（後鏡頭）
@@ -518,6 +525,15 @@ final class HandTracker {
 struct FingerOverlay: View {
 
     let tracker: HandTracker
+
+    /// 食指圓點的顏色：捏合時綠色，平常藍色
+    private var indexDotColor: Color {
+        if tracker.isPinching {
+            return Color.green                       // 捏合中
+        } else {
+            return Color.blue                        // 沒有捏合
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -543,7 +559,7 @@ struct FingerOverlay: View {
 
                 // 藍點：食指指尖。捏合時整體換成綠色，一眼就知道有沒有觸發。
                 Circle()
-                    .fill(tracker.isPinching ? Color.green : Color.blue)
+                    .fill(indexDotColor)
                     .frame(width: 20, height: 20)
                     .position(tracker.indexPoint)
             }

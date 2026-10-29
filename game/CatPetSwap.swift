@@ -82,11 +82,19 @@ final class CatPetSwap {
         guard let walk = Self.allAnimations(in: walkModel).first else {   // the walk: first animation in cat.usdz
             throw SwapError.noAnimation("cat.usdz")
         }
-        walkOwner = walk.owner; walkAnimation = walk.animation            // where the walk lives
+        walkOwner = walk.owner                                            // the entity that owns the walk animation
+        walkAnimation = walk.animation                                    // the walk clip itself
 
         petTracks = Self.animationsToPlay(in: pet)                        // skeleton on its own entity + each heart on its own entity
         guard !petTracks.isEmpty else { throw SwapError.noAnimation(Self.petFileName) } // nothing to play
-        petDuration = petTracks.map { $0.animation.definition.duration }.max() ?? 0 // the longest one decides the length
+        var longest: TimeInterval = 0                                     // the longest reaction animation so far
+        for track in petTracks {                                          // look at every reaction animation
+            let duration = track.animation.definition.duration            // its length in seconds
+            if duration > longest {                                       // longer than the longest so far?
+                longest = duration                                        // remember it
+            }
+        }
+        petDuration = longest                                             // the longest one decides the length
     }
 
     /// Starts (or restarts) the walk from its first frame, looping forever.
@@ -102,7 +110,8 @@ final class CatPetSwap {
         guard state == .walking, !petTracks.isEmpty else { return }       // ignore while already reacting, or before load()
         state = .waitingForStep                                           // let the cat finish its current step first
         guard walkController != nil, let scene = walkModel.scene else {   // can't follow the step (walk not started by us)?
-            swapToPet(); return                                           // then swap right away
+            swapToPet()                                                   // then swap right away
+            return                                                        // nothing more to do here
         }
         lastPhase = walkPhase()                                           // where we are in the step now
         waited = 0                                                        // start the safety timer
@@ -138,16 +147,20 @@ final class CatPetSwap {
 
     /// Hide the walking cat, show the pet cat on the same spot, then play the reaction animations.
     private func swapToPet() {
-        updateSubscription?.cancel(); updateSubscription = nil            // stop the step check
+        updateSubscription?.cancel()                                      // stop the step check
+        updateSubscription = nil                                          // and forget it
         guard let pet = petModel, !petTracks.isEmpty,                     // loaded?
               let scene = walkModel.scene else {                          // in a scene? (needed to hear when it ends)
-            state = .walking; return                                      // no: stay walking
+            state = .walking                                              // no: stay walking
+            return                                                        // don't swap
         }
         pet.transform = walkModel.transform                               // copy where the walking cat is right now
         walkModel.isEnabled = false                                       // hide the walking cat
         pet.isEnabled = true                                              // show the pet cat FIRST…
-        petControllers = petTracks.map { track in                         // …THEN start skeleton + hearts from 0 s
-            track.owner.playAnimation(track.animation, transitionDuration: 0, startsPaused: false)
+        petControllers = []                                               // start with an empty list
+        for track in petTracks {                                          // …THEN start skeleton + hearts from 0 s
+            let controller = track.owner.playAnimation(track.animation, transitionDuration: 0, startsPaused: false) // play one
+            petControllers.append(controller)                             // remember it (to count "finished" and to stop it)
         }
         finishedCount = 0                                                 // none finished yet
         reactionTime = 0                                                  // safety timer starts at 0
@@ -181,11 +194,15 @@ final class CatPetSwap {
     /// Hide the pet cat, show the walking cat, walk again from the first frame.
     private func swapToWalk() {
         guard state == .petting else { return }                           // run once per reaction
-        completedSubscription?.cancel(); completedSubscription = nil      // stop listening for "finished"
-        updateSubscription?.cancel(); updateSubscription = nil            // stop the safety timer
+        completedSubscription?.cancel()                                   // stop listening for "finished"
+        completedSubscription = nil                                       // and forget it
+        updateSubscription?.cancel()                                      // stop the safety timer
+        updateSubscription = nil                                          // and forget it
         walkModel.isEnabled = true                                        // show the walking cat
         petModel?.isEnabled = false                                       // hide the pet cat
-        petControllers.forEach { $0.stop() }                              // release the finished reaction animations
+        for controller in petControllers {                                // every reaction animation
+            controller.stop()                                             // release it
+        }
         petControllers.removeAll()                                        // ready for the next pet
         startWalking()                                                    // frame 0 of the walk = the pose the reaction ended on
         state = .walking                                                  // movement can continue
@@ -197,41 +214,96 @@ final class CatPetSwap {
     /// - everything else (the 5 hearts): the animation on the deepest entities that have one.
     private static func animationsToPlay(in root: Entity) -> [(owner: Entity, animation: AnimationResource)] {
         let everything = allEntities(in: root)                            // the loaded root and every child, grandchild…
-        let owners = everything.filter { !$0.availableAnimations.isEmpty } // entities that list animations
+        var owners: [Entity] = []                                         // entities that list animations
+        for entity in everything {                                        // look at every entity
+            if !entity.availableAnimations.isEmpty {                      // it has at least one animation
+                owners.append(entity)                                     // keep it
+            }
+        }
         var chosen: [Entity] = []                                         // entities we will play on
 
-        for skeleton in everything where skeleton.components.has(SkeletalPosesComponent.self) { // entities holding a skeleton pose
+        // 1. The skeleton: start at each entity that holds a skeleton pose and go up to the nearest animation.
+        for skeleton in everything {                                      // look at every entity
+            if !skeleton.components.has(SkeletalPosesComponent.self) {    // not holding a skeleton pose?
+                continue                                                  // skip it
+            }
             var current: Entity? = skeleton                               // start at the skeleton entity…
-            while let entity = current, entity.availableAnimations.isEmpty, entity !== root {
-                current = entity.parent                                   // …and go up until an entity has an animation
+            while let entity = current {                                  // …and walk up the parents
+                if !entity.availableAnimations.isEmpty {                  // this one has an animation
+                    break                                                 // stop here
+                }
+                if entity === root {                                      // reached the top of the file
+                    break                                                 // stop here
+                }
+                current = entity.parent                                   // go one level up
             }
-            if let owner = current, !owner.availableAnimations.isEmpty,
-               !chosen.contains(where: { $0 === owner }) {
-                chosen.append(owner)                                      // play the skeleton here
+            if let owner = current {                                      // we stopped on an entity
+                if !owner.availableAnimations.isEmpty {                   // and it really has an animation
+                    if !Self.list(chosen, contains: owner) {              // not chosen yet
+                        chosen.append(owner)                              // play the skeleton here
+                    }
+                }
             }
         }
 
-        for owner in owners {                                             // the rest: deepest entities with an animation
-            let animatedBelow = allEntities(in: owner).dropFirst().contains { !$0.availableAnimations.isEmpty } // any animated child?
-            let skeletonRelated = chosen.contains {                       // same branch as a skeleton we already play?
-                $0 === owner || isAncestor($0, of: owner) || isAncestor(owner, of: $0)
+        // 2. The rest (the hearts): the deepest entities with an animation, not on the skeleton's branch.
+        for owner in owners {                                             // every entity that has an animation
+            var animatedBelow = false                                     // does any child also have one?
+            for child in allEntities(in: owner).dropFirst() {             // every entity below this one
+                if !child.availableAnimations.isEmpty {                   // this child has an animation
+                    animatedBelow = true                                  // so `owner` is not the deepest
+                    break                                                 // no need to look further
+                }
             }
-            if !animatedBelow && !skeletonRelated { chosen.append(owner) } // a leaf of its own (a heart): play it
+
+            var skeletonRelated = false                                   // same branch as a skeleton we already play?
+            for picked in chosen {                                        // every entity chosen so far
+                if picked === owner || isAncestor(picked, of: owner) || isAncestor(owner, of: picked) {
+                    skeletonRelated = true                                // same branch
+                    break                                                 // no need to look further
+                }
+            }
+
+            if !animatedBelow && !skeletonRelated {                       // a leaf of its own (a heart)
+                chosen.append(owner)                                      // play it
+            }
         }
 
-        return chosen.map { (owner: $0, animation: $0.availableAnimations[0]) } // one per entity (two would replace each other)
+        // 3. One animation per entity (two on one entity would replace each other).
+        var result: [(owner: Entity, animation: AnimationResource)] = []  // what we will play
+        for owner in chosen {                                             // every chosen entity
+            let first = owner.availableAnimations[0]                      // its first animation
+            result.append((owner: owner, animation: first))               // add it to the list
+        }
+        return result                                                     // skeleton + hearts
+    }
+
+    /// true when `entity` is already in `list` (same object, not just same name).
+    private static func list(_ list: [Entity], contains entity: Entity) -> Bool {
+        for item in list {                                                // every entity in the list
+            if item === entity {                                          // the very same object
+                return true                                               // found it
+            }
+        }
+        return false                                                      // not in the list
     }
 
     /// The entity itself and all of its descendants (depth-first).
     private static func allEntities(in entity: Entity) -> [Entity] {
-        [entity] + entity.children.flatMap { allEntities(in: $0) }        // me, then my children's trees
+        var result: [Entity] = [entity]                                   // me first
+        for child in entity.children {                                    // then each child…
+            result += allEntities(in: child)                              // …with its whole tree
+        }
+        return result                                                     // me + everything below me
     }
 
     /// true when `ancestor` is a parent, grandparent… of `entity`.
     private static func isAncestor(_ ancestor: Entity, of entity: Entity) -> Bool {
         var current = entity.parent                                       // start one level up
         while let parent = current {                                      // walk up to the top
-            if parent === ancestor { return true }                        // found it
+            if parent === ancestor {                                      // is this the one?
+                return true                                               // found it
+            }
             current = parent.parent                                       // keep going up
         }
         return false                                                      // not above it
@@ -239,7 +311,10 @@ final class CatPetSwap {
 
     /// Every animation in this entity and all of its children (depth-first, the entity itself first).
     private static func allAnimations(in entity: Entity) -> [(owner: Entity, animation: AnimationResource)] {
-        var found = entity.availableAnimations.map { (owner: entity, animation: $0) } // this entity's animations
+        var found: [(owner: Entity, animation: AnimationResource)] = []   // nothing found yet
+        for animation in entity.availableAnimations {                     // this entity's own animations
+            found.append((owner: entity, animation: animation))           // add each one
+        }
         for child in entity.children {                                    // then look deeper
             found += allAnimations(in: child)                             // add the children's animations
         }
