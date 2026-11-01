@@ -40,6 +40,9 @@ struct GameView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
         }
+        .background {                                   // 在所有東西後面放背景（Cat3DView 的背景是透明的，所以草地會出現在貓咪後面）
+            GrassBackgroundView()                       // 草地背景（GrassBackgroundView.swift）
+        }
         .navigationTitle("")
         .navigationBarBackButtonHidden()
 

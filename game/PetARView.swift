@@ -279,6 +279,11 @@ final class CatController {
         // 讓追蹤器共用 ARView 自己的 session（session 只有一個擁有者，狀態不會打架）
         tracker.start(session: arView.session)
 
+        // 單指在螢幕上左右滑 → 轉動貓咪面向的方向（見 handleTurnPan）
+        let turnPan = UIPanGestureRecognizer(target: self, action: #selector(handleTurnPan(_:)))  // 手指滑動偵測器，交給 handleTurnPan 處理
+        turnPan.maximumNumberOfTouches = 1                                                         // 只認一根手指
+        arView.addGestureRecognizer(turnPan)                                                       // 裝到 AR 畫面上
+
         // 載入 cat.usdz。先掛在世界原點，第一張有效影格出現時再擺到鏡頭前
         // （比固定延遲幾秒再擺放可靠，因為是真的等到 ARKit 有畫面才動作）。
         guard let catEntity = try? ModelEntity.loadModel(named: "cat.usdz") else {
@@ -703,6 +708,48 @@ final class CatController {
             }
         }
         return rect                                                        // 貓咪在螢幕上的範圍
+    }
+
+    // ── 用手指轉貓咪（單指在螢幕上左右滑）──────────────────────────
+
+    /// 手指每左右移動 1 點，貓咪轉幾度。
+    /// 調高：轉得快，缺點是不好停在想要的方向。調低：好對準，缺點是要滑很多次才轉一圈。
+    /// 0.5 → 從螢幕最左滑到最右（iPhone 15 約 393 點）≈ 轉 197°（半圈多一點）。
+    private let turnDegreesPerPoint: Float = 0.5
+
+    /// 上一次收到時，手指從按下開始總共左右移動了多少（點）。用來算「這一下又多移動了多少」。
+    private var lastTurnTranslationX: CGFloat = 0
+
+    /// 單指在螢幕上左右滑 → 貓咪原地左右轉（像轉桌上的玩具：手指往右，貓咪靠近你的那一面就往右轉）。
+    /// 只看左右移動，上下移動不影響；撫摸反應播放中不轉。
+    @objc func handleTurnPan(_ gesture: UIPanGestureRecognizer) {
+        guard let arView, let cat else {                                   // AR 畫面或貓咪還沒準備好
+            return
+        }
+
+        let translationX = gesture.translation(in: arView).x               // 從按下到現在總共左右移動多少（往右是正）
+
+        if gesture.state == .began {                                       // 手指剛開始滑
+            lastTurnTranslationX = translationX                            // 從這裡開始算
+            return
+        }
+
+        if gesture.state != .changed {                                     // 放開或被取消 → 不用轉
+            return
+        }
+
+        let deltaX = translationX - lastTurnTranslationX                   // 這一下又多移動了多少（點）
+        lastTurnTranslationX = translationX                                // 記住，下一次從這裡算
+
+        if isReacting {                                                    // 撫摸反應播放中 → 不轉
+            return
+        }
+
+        let degrees = Float(deltaX) * turnDegreesPerPoint                  // 要轉幾度
+        let radians = degrees * .pi / 180                                  // 度 → 弧度（RealityKit 用弧度）
+        let turn = simd_quatf(angle: radians, axis: SIMD3<Float>(0, 1, 0)) // 繞「垂直往上」的軸 = 原地左右轉
+        let current = cat.orientation(relativeTo: nil)                     // 貓咪現在在世界中的方向
+        cat.setOrientation(turn * current, relativeTo: nil)                // 在原本的方向上再多轉這一點
     }
 
     // ── 重置 ───────────────────────────────────────────────────

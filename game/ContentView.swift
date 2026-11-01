@@ -48,6 +48,10 @@ struct ContentView: View {
                 .font(.system(.largeTitle, design: .monospaced))
                 .padding()
             } //Zstack
+            .frame(maxWidth: .infinity, maxHeight: .infinity)  // 撐滿整個畫面（不然 ZStack 只有中間文字那麼大，背景也只會蓋那一小塊）
+            .background {                                       // 在所有東西後面放背景
+                GrassBackgroundView()                           // 草地背景（GrassBackgroundView.swift）
+            }
             .navigationTitle("")
             .navigationBarBackButtonHidden()
             .navigationBarTitleDisplayMode(.inline)
